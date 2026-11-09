@@ -56,6 +56,16 @@ def read_csv_jp(path):
     raise RuntimeError(f"{path} の文字コードを判定できません（UTF-8で保存してください）")
 
 
+def to_ascii_host(h):
+    """日本語ドメインは punycode に揃える（例: 交通事故解決.jp）"""
+    if h and not h.isascii():
+        try:
+            return h.encode("idna").decode("ascii")
+        except Exception:
+            return h
+    return h
+
+
 def clean_domain(s):
     s = (s or "").strip().lower()
     if "://" in s:
@@ -63,6 +73,7 @@ def clean_domain(s):
     parts = s.split()
     s = parts[0] if parts else ""
     s = s.split("/")[0].split(":")[0]
+    s = to_ascii_host(s)
     return s[4:] if s.startswith("www.") else s
 
 
@@ -72,6 +83,25 @@ def host_of(url):
     if "://" not in url:
         url = "https://" + url
     return clean_domain(urlparse(url).netloc)
+
+
+def path_of(url):
+    if not url:
+        return ""
+    if "://" not in url:
+        url = "https://" + url
+    return urlparse(url).path.lower()
+
+
+def clean_target(s):
+    """domains.csv の値 → (ホスト, パス)。例: agoora.co.jp/rikon/ → ("agoora.co.jp", "/rikon")"""
+    s = (s or "").strip()
+    if not s:
+        return "", ""
+    full = s if "://" in s else "https://" + s
+    host = clean_domain(full)
+    path = urlparse(full).path.lower().rstrip("/")
+    return host, path
 
 
 def col(df, *names):
@@ -97,28 +127,30 @@ def load_keywords():
 
 
 def load_targets():
-    """domains.csv → (マッチ用[(domain,label)], 表示順のlabel一覧, {label: 分野set})
+    """domains.csv → (マッチ用[(host,path,label)], 表示順のlabel一覧, {label: 分野set})
+    domain 列は「example.com」でも「example.com/rikon/」（パス単位）でも可。
     同じ label の行は1社として扱う（複数ドメインのうち最高順位を採用）。
     分野が空欄 or「総合」なら全キーワードが対象。"""
     df = read_csv_jp(BASE / "domains.csv")
     targets, labels, label_cats = [], [], {}
     for d, l, c in zip(col(df, "domain", "ドメイン"), col(df, "label", "表示名"), col(df, "分野", "category")):
-        d = clean_domain(d)
-        if not d:
+        host, path = clean_target(d)
+        if not host:
             continue
-        l = l.strip() or d
-        targets.append((d, l))
+        l = l.strip() or (host + path)
+        targets.append((host, path, l))
         label_cats.setdefault(l, set()).update(split_cats(c) or {"総合"})
         if l not in labels:
             labels.append(l)
-    # サブドメイン指定を優先してマッチさせるため、長いドメインから判定
-    targets.sort(key=lambda t: -len(t[0]))
+    # パス指定・サブドメイン指定を優先してマッチさせるため、長いものから判定
+    targets.sort(key=lambda t: -(len(t[0]) + len(t[1])))
     return targets, labels, label_cats
 
 
-def match_label(host, targets):
-    for d, label in targets:
-        if host == d or host.endswith("." + d):
+def match_label(url, targets):
+    host, path = host_of(url), path_of(url)
+    for h, p, label in targets:
+        if (host == h or host.endswith("." + h)) and (not p or path == p or path.startswith(p + "/")):
             return label
     return ""
 
@@ -224,7 +256,7 @@ def build_report(run_at, meta, targets, labels, label_cats):
     hist = read_csv_jp(HIST_PATH)
     runs = read_csv_jp(RUNS_PATH)
     hist["rank"] = pd.to_numeric(hist["rank"], errors="coerce")
-    hist["target"] = hist["domain"].map(lambda h: match_label(h, targets))
+    hist["target"] = hist["url"].map(lambda u: match_label(u, targets))
 
     cutoff = (datetime.now(JST) - timedelta(days=WINDOW_DAYS)).strftime("%Y-%m-%d %H:%M")
     hist_w = hist[hist["run_at"] >= cutoff]
