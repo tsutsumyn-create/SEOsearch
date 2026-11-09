@@ -9,6 +9,7 @@ keywords.csv のキーワードを Google（日本）で検索し、domains.csv 
 結果は data/history.csv に蓄積されるので、定期実行すると推移・出現率が見られる。
 """
 import os
+import re
 import sys
 import time
 from datetime import datetime, timedelta, timezone
@@ -73,25 +74,46 @@ def host_of(url):
     return clean_domain(urlparse(url).netloc)
 
 
+def col(df, *names):
+    for n in names:
+        if n in df.columns:
+            return df[n]
+    return pd.Series([""] * len(df), index=df.index)
+
+
+def split_cats(c):
+    return {x.strip() for x in re.split(r"[／/・|、]", c or "") if x.strip()}
+
+
 def load_keywords():
+    """keywords.csv → {キーワード: (分野, 意図)}（分野・意図の列は任意）"""
     df = read_csv_jp(BASE / "keywords.csv")
-    kws = [k.strip() for k in df["keyword"] if k.strip()]
-    return list(dict.fromkeys(kws))
+    meta = {}
+    for k, c, i in zip(col(df, "keyword", "キーワード"), col(df, "分野", "category"), col(df, "意図", "intent")):
+        k = k.strip()
+        if k and k not in meta:
+            meta[k] = (c.strip(), i.strip())
+    return meta
 
 
 def load_targets():
+    """domains.csv → (マッチ用[(domain,label)], 表示順のlabel一覧, {label: 分野set})
+    同じ label の行は1社として扱う（複数ドメインのうち最高順位を採用）。
+    分野が空欄 or「総合」なら全キーワードが対象。"""
     df = read_csv_jp(BASE / "domains.csv")
-    targets = []
-    for _, r in df.iterrows():
-        d = clean_domain(r.get("domain", ""))
-        if d:
-            targets.append([d, (r.get("label", "") or "").strip() or d])
-    labels = [l for _, l in targets]
-    for t in targets:                      # ラベル重複時はドメインを付けて区別
-        if labels.count(t[1]) > 1:
-            t[1] = f"{t[1]}（{t[0]}）"
+    targets, labels, label_cats = [], [], {}
+    for d, l, c in zip(col(df, "domain", "ドメイン"), col(df, "label", "表示名"), col(df, "分野", "category")):
+        d = clean_domain(d)
+        if not d:
+            continue
+        l = l.strip() or d
+        targets.append((d, l))
+        label_cats.setdefault(l, set()).update(split_cats(c) or {"総合"})
+        if l not in labels:
+            labels.append(l)
     # サブドメイン指定を優先してマッチさせるため、長いドメインから判定
-    return sorted([tuple(t) for t in targets], key=lambda t: -len(t[0]))
+    targets.sort(key=lambda t: -len(t[0]))
+    return targets, labels, label_cats
 
 
 def match_label(host, targets):
@@ -177,16 +199,28 @@ def append_csv(path, rows, cols):
 
 
 # ---------------------------------------------------------------- レポート
+NA = "－"   # 分野対象外
+
+
 def to_int(v):
-    return int(v) if pd.notna(v) else None
+    return int(v) if v is not None and pd.notna(v) else None
 
 
 def top_domains(df, n=3):
     return " / ".join(df["domain"].value_counts().head(n).index) if len(df) else ""
 
 
-def build_report(run_at, keywords, targets):
-    labels = [l for _, l in sorted(targets, key=lambda t: load_order[t[0]])]
+def build_report(run_at, meta, targets, labels, label_cats):
+    keywords = list(meta)
+
+    def applicable(kw, label):
+        kcat = meta[kw][0]
+        cats = label_cats.get(label, {"総合"})
+        return (not kcat) or kcat == "総合" or "総合" in cats or kcat in cats
+
+    def head(kw, dev):
+        return {"キーワード": kw, "分野": meta[kw][0], "意図": meta[kw][1], "端末": DEV_JA.get(dev, dev)}
+
     hist = read_csv_jp(HIST_PATH)
     runs = read_csv_jp(RUNS_PATH)
     hist["rank"] = pd.to_numeric(hist["rank"], errors="coerce")
@@ -203,16 +237,53 @@ def build_report(run_at, keywords, targets):
     org_rows = []
     for kw in keywords:
         for dev in DEVICES:
-            row = {"キーワード": kw, "端末": DEV_JA.get(dev, dev)}
+            row = head(kw, dev)
             ok = status_latest.get((kw, dev)) == "ok"
             for l in labels:
-                v = best.get((kw, dev, l))
-                row[l] = (to_int(v) if v is not None else OUT_OF_RANGE) if ok else "取得失敗"
+                if not applicable(kw, l):
+                    row[l] = NA
+                elif not ok:
+                    row[l] = "取得失敗"
+                else:
+                    v = to_int(best.get((kw, dev, l)))
+                    row[l] = v if v is not None else OUT_OF_RANGE
             row["参考：上位3ドメイン"] = top_domains(
                 latest[(latest["keyword"] == kw) & (latest["device"] == dev) & (latest["rank"] <= 3)]
                 .sort_values("rank"), 3)
             org_rows.append(row)
     org_df = pd.DataFrame(org_rows)
+
+    # --- ドメイン別サマリ（最新・分野対象セルのみ）
+    intents = list(dict.fromkeys(i for _, i in meta.values() if i))
+    lim = PAGES * 10
+    sum_rows = []
+    for dev in DEVICES:
+        tot_n = tot_in = 0
+        tot_int = {i: [0, 0] for i in intents}
+        for l in labels:
+            tgt = [kw for kw in keywords if applicable(kw, l) and status_latest.get((kw, dev)) == "ok"]
+            rk = {kw: to_int(best.get((kw, dev, l))) for kw in tgt}
+            ranks = [r for r in rk.values() if r is not None]
+            n = len(tgt)
+            row = {"端末": DEV_JA.get(dev, dev), "ドメイン": l, "対象KW数": n, "圏内KW数": len(ranks),
+                   "圏内率": len(ranks) / n if n else "-",
+                   "1〜3位": sum(r <= 3 for r in ranks), "4〜10位": sum(3 < r <= 10 for r in ranks),
+                   f"11〜{lim}位": sum(r > 10 for r in ranks),
+                   "平均順位（圏内のみ）": round(sum(ranks) / len(ranks), 1) if ranks else "-"}
+            for i in intents:
+                ks = [kw for kw in tgt if meta[kw][1] == i]
+                hit = sum(rk[kw] is not None for kw in ks)
+                row[f"圏内率_{i}"] = hit / len(ks) if ks else "-"
+                tot_int[i][0] += len(ks); tot_int[i][1] += hit
+            tot_n += n; tot_in += len(ranks)
+            sum_rows.append(row)
+        total = {"端末": DEV_JA.get(dev, dev), "ドメイン": "【全体】", "対象KW数": tot_n, "圏内KW数": tot_in,
+                 "圏内率": tot_in / tot_n if tot_n else "-",
+                 "1〜3位": "", "4〜10位": "", f"11〜{lim}位": "", "平均順位（圏内のみ）": ""}
+        for i in intents:
+            total[f"圏内率_{i}"] = tot_int[i][1] / tot_int[i][0] if tot_int[i][0] else "-"
+        sum_rows.append(total)
+    sum_df = pd.DataFrame(sum_rows)
 
     # --- 広告（集計期間内の出現率・上部平均順位）
     devs_seen = [d for d in ("mobile", "desktop", "tablet") if d in set(runs_ok["device"])] or DEVICES
@@ -230,9 +301,12 @@ def build_report(run_at, keywords, targets):
     for kw in keywords:
         for dev in devs_seen:
             n = n_runs.get((kw, dev), 0)
-            base = {"キーワード": kw, "端末": DEV_JA.get(dev, dev), "計測回数": n}
-            r1, r2 = dict(base), dict(base)
+            r1 = {**head(kw, dev), "計測回数": n}
+            r2 = dict(r1)
             for l in labels:
+                if not applicable(kw, l):
+                    r1[l] = r2[l] = NA
+                    continue
                 r1[l] = (appear.get((kw, dev, l), 0) / n) if n else "-"
                 v = top_avg.get((kw, dev, l))
                 r2[l] = round(v, 1) if v is not None else "-"
@@ -242,7 +316,7 @@ def build_report(run_at, keywords, targets):
             pos_rows.append(r2)
     rate_df, pos_df = pd.DataFrame(rate_rows), pd.DataFrame(pos_rows)
 
-    # --- オーガニック推移
+    # --- オーガニック推移（分野対象の組み合わせのみ）
     run_list = sorted(runs_ok["run_at"].unique())[-MAX_TREND_COLS:]
     org_w = hist_w[(hist_w["type"] == "organic") & (hist_w["target"] != "")]
     best_t = org_w.groupby(["keyword", "device", "target", "run_at"])["rank"].min().to_dict()
@@ -251,13 +325,15 @@ def build_report(run_at, keywords, targets):
     for kw in keywords:
         for dev in devs_seen:
             for l in labels:
-                row = {"キーワード": kw, "端末": DEV_JA.get(dev, dev), "ドメイン": l}
+                if not applicable(kw, l):
+                    continue
+                row = {**head(kw, dev), "ドメイン": l}
                 for r in run_list:
                     if (kw, dev, r) not in ok_set:
                         row[r] = ""
                     else:
-                        v = best_t.get((kw, dev, l, r))
-                        row[r] = to_int(v) if v is not None else OUT_OF_RANGE
+                        v = to_int(best_t.get((kw, dev, l, r)))
+                        row[r] = v if v is not None else OUT_OF_RANGE
                 trend_rows.append(row)
     trend_df = pd.DataFrame(trend_rows)
 
@@ -266,8 +342,10 @@ def build_report(run_at, keywords, targets):
     raw["device"] = raw["device"].map(lambda d: DEV_JA.get(d, d))
     raw["type"] = raw["type"].map({"organic": "オーガニック", "ad": "広告"})
     raw["block"] = raw["block"].map({"top": "上部", "bottom": "下部"}).fillna("")
-    raw = raw[["keyword", "device", "type", "block", "rank", "domain", "target", "title", "url"]]
-    raw.columns = ["キーワード", "端末", "種別", "広告枠", "順位", "ドメイン", "追跡対象", "タイトル", "URL"]
+    raw["cat"] = raw["keyword"].map(lambda k: meta.get(k, ("", ""))[0])
+    raw["intent"] = raw["keyword"].map(lambda k: meta.get(k, ("", ""))[1])
+    raw = raw[["keyword", "cat", "intent", "device", "type", "block", "rank", "domain", "target", "title", "url"]]
+    raw.columns = ["キーワード", "分野", "意図", "端末", "種別", "広告枠", "順位", "ドメイン", "追跡対象", "タイトル", "URL"]
     log = runs.iloc[::-1].head(1000).rename(columns={
         "run_at": "実行日時", "keyword": "キーワード", "device": "端末", "status": "結果"})
 
@@ -275,12 +353,14 @@ def build_report(run_at, keywords, targets):
         ["最新の実行日時（JST）", run_at],
         ["検索条件", f"google.co.jp / 日本語 / 地域: {LOCATION or '指定なし（日本）'}"],
         ["端末", "、".join(DEV_JA.get(d, d) for d in DEVICES)],
-        ["取得範囲", f"上位{PAGES * 10}位まで（それより下は「{OUT_OF_RANGE}」）"],
+        ["取得範囲", f"上位{lim}位まで（それより下は「{OUT_OF_RANGE}」）"],
+        ["分野対象外", f"キーワードの分野がサイトの分野と合わない組み合わせは「{NA}」（集計からも除外）"],
         ["出現率・推移の集計期間", f"直近{WINDOW_DAYS}日"],
         ["", ""],
-        ["オーガニック_最新", "最新の実行時点での各ドメインの最高順位"],
+        ["ドメイン別サマリ", "最新実行での各サイトの圏内率・順位分布（検索意図別の圏内率つき）。【全体】は表のマスのうち圏内の割合"],
+        ["オーガニック_最新", "最新の実行時点での各サイトの最高順位"],
         ["オーガニック_推移", "実行ごとの順位の推移（空欄は未計測）"],
-        ["広告_出現率", "集計期間の計測回数のうち、そのドメインの広告が表示された割合"],
+        ["広告_出現率", "集計期間の計測回数のうち、そのサイトの広告が表示された割合"],
         ["広告_上部平均順位", "検索結果上部に広告が出たときの平均掲載順位（1=最上位）"],
         ["生データ_最新", "最新実行で取得した全結果（追跡対象外のサイトも含む）"],
         ["", ""],
@@ -291,6 +371,7 @@ def build_report(run_at, keywords, targets):
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
     with pd.ExcelWriter(REPORT_PATH, engine="openpyxl") as w:
         info.to_excel(w, sheet_name="説明", index=False)
+        sum_df.to_excel(w, sheet_name="ドメイン別サマリ", index=False)
         org_df.to_excel(w, sheet_name="オーガニック_最新", index=False)
         trend_df.to_excel(w, sheet_name="オーガニック_推移", index=False)
         rate_df.to_excel(w, sheet_name="広告_出現率", index=False)
@@ -306,15 +387,21 @@ def style_workbook(n_labels):
     head_fill = PatternFill("solid", fgColor="1F3864")
     g1 = PatternFill("solid", fgColor="A9D08E")
     g2 = PatternFill("solid", fgColor="E2EFDA")
+    grey = Font(color="BFBFBF")
     for ws in wb.worksheets:
         for c in ws[1]:
             c.font = Font(bold=True, color="FFFFFF")
             c.fill = head_fill
             c.alignment = Alignment(vertical="center", wrap_text=True)
-        for i, col in enumerate(ws.iter_cols(min_row=1, max_row=min(ws.max_row, 200)), start=1):
-            width = max((len(str(c.value)) if c.value is not None else 0) for c in col)
+        for i, colc in enumerate(ws.iter_cols(min_row=1, max_row=min(ws.max_row, 200)), start=1):
+            width = max((len(str(c.value)) if c.value is not None else 0) for c in colc)
             ws.column_dimensions[get_column_letter(i)].width = min(max(8, width * 1.6), 60)
-    wb["説明"].column_dimensions["B"].width = 90
+        for row in ws.iter_rows(min_row=2):
+            for c in row:
+                if c.value == NA:
+                    c.font = grey
+                    c.alignment = Alignment(horizontal="center")
+    wb["説明"].column_dimensions["B"].width = 100
 
     def rank_rules(ws, first_col, last_col):
         if ws.max_row < 2 or last_col < first_col:
@@ -323,49 +410,55 @@ def style_workbook(n_labels):
         ws.conditional_formatting.add(rng, CellIsRule(operator="between", formula=["1", "3"], fill=g1))
         ws.conditional_formatting.add(rng, CellIsRule(operator="between", formula=["4", "10"], fill=g2))
 
-    ws = wb["オーガニック_最新"]; ws.freeze_panes = "C2"; rank_rules(ws, 3, 2 + n_labels)
-    ws = wb["オーガニック_推移"]; ws.freeze_panes = "D2"; rank_rules(ws, 4, ws.max_column)
-    ws = wb["広告_上部平均順位"]; ws.freeze_panes = "D2"; rank_rules(ws, 4, 3 + n_labels)
-    ws = wb["広告_出現率"]; ws.freeze_panes = "D2"
+    ws = wb["オーガニック_最新"]; ws.freeze_panes = "E2"; rank_rules(ws, 5, 4 + n_labels)
+    ws = wb["オーガニック_推移"]; ws.freeze_panes = "F2"; rank_rules(ws, 6, ws.max_column)
+    ws = wb["広告_上部平均順位"]; ws.freeze_panes = "F2"; rank_rules(ws, 6, 5 + n_labels)
+    ws = wb["広告_出現率"]; ws.freeze_panes = "F2"
     if ws.max_row >= 2 and n_labels:
-        for row in ws.iter_rows(min_row=2, min_col=4, max_col=3 + n_labels):
+        for row in ws.iter_rows(min_row=2, min_col=6, max_col=5 + n_labels):
             for c in row:
                 if isinstance(c.value, (int, float)):
                     c.number_format = "0%"
-        rng = f"D2:{get_column_letter(3 + n_labels)}{ws.max_row}"
+        rng = f"F2:{get_column_letter(5 + n_labels)}{ws.max_row}"
         ws.conditional_formatting.add(rng, CellIsRule(operator="greaterThanOrEqual", formula=["0.5"], fill=g1))
         ws.conditional_formatting.add(rng, CellIsRule(operator="between", formula=["0.0001", "0.4999"], fill=g2))
+    ws = wb["ドメイン別サマリ"]; ws.freeze_panes = "C2"
+    for j, h in enumerate(ws[1], start=1):
+        if h.value and "圏内率" in str(h.value):
+            for row in ws.iter_rows(min_row=2, min_col=j, max_col=j):
+                for c in row:
+                    if isinstance(c.value, (int, float)):
+                        c.number_format = "0%"
+    for row in ws.iter_rows(min_row=2):
+        if row[1].value == "【全体】":
+            for c in row:
+                c.font = Font(bold=True)
     for name in ("生データ_最新", "実行ログ"):
         wb[name].freeze_panes = "A2"
     wb.save(REPORT_PATH)
 
 
 # ---------------------------------------------------------------- メイン
-load_order = {}
-
-
 def run(run_at=None):
-    global load_order
     if not API_KEY:
         sys.exit("SERPAPI_KEY が設定されていません（GitHub の Secrets に登録してください）")
     bad = [d for d in DEVICES if d not in DEV_JA]
     if bad:
         sys.exit(f"DEVICES の指定が不正です: {bad}（mobile / desktop / tablet）")
-    keywords, targets = load_keywords(), load_targets()
-    if not keywords:
+    meta = load_keywords()
+    targets, labels, label_cats = load_targets()
+    if not meta:
         sys.exit("keywords.csv にキーワードがありません")
-    df = read_csv_jp(BASE / "domains.csv")
-    load_order = {clean_domain(d): i for i, d in enumerate(df["domain"])}
     run_at = run_at or datetime.now(JST).strftime("%Y-%m-%d %H:%M")
-    print(f"実行: {run_at} / キーワード {len(keywords)}件 × 端末 {len(DEVICES)} × {PAGES}ページ"
-          f" = 最大 {len(keywords) * len(DEVICES) * PAGES} クレジット")
+    print(f"実行: {run_at} / キーワード {len(meta)}件 × 端末 {len(DEVICES)} × {PAGES}ページ"
+          f" = 最大 {len(meta) * len(DEVICES) * PAGES} クレジット")
 
-    rows, runs = fetch(keywords, run_at)
+    rows, runs = fetch(list(meta), run_at)
     if all(r["status"] != "ok" for r in runs):
         sys.exit(f"全件取得に失敗しました。最初のエラー: {runs[0]['status']}")
     append_csv(HIST_PATH, rows, HIST_COLS)
     append_csv(RUNS_PATH, runs, RUN_COLS)
-    build_report(run_at, keywords, targets)
+    build_report(run_at, meta, targets, labels, label_cats)
 
 
 if __name__ == "__main__":
