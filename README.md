@@ -1,0 +1,60 @@
+# SERP順位チェッカー
+
+キーワードを Google（日本）で検索し、指定したドメインの **オーガニック順位** と
+**リスティング広告の出現率・掲載順位** を Excel にまとめるツールです。
+GitHub Actions 上で動くので、手元に Python は不要です。
+
+## 初期設定（最初の1回だけ）
+
+1. **SerpApi のAPIキーを取得**：https://serpapi.com でアカウントを作り、ダッシュボードの「API Key」をコピー（無料枠あり。料金・枠は公式で要確認）
+2. **GitHub にリポジトリを作成**：クライアント関連のキーワードを扱う場合は必ず **Private** にする
+3. **ファイルをアップロード**：「Add file → Upload files」で以下をアップロード
+   `rank_check.py` / `requirements.txt` / `keywords.csv` / `domains.csv` / `README.md`
+4. **ワークフローを作成**：「Add file → Create new file」でファイル名欄に
+   `.github/workflows/rank-check.yml` と入力し、同名ファイルの中身を貼り付けてコミット
+   （`.github` フォルダはドラッグ＆ドロップでは上がらないことがあるため）
+5. **APIキーを登録**：Settings → Secrets and variables → Actions → 「New repository secret」
+   Name: `SERPAPI_KEY` / Secret: コピーしたキー
+6. （任意）**地域を指定**：同じ画面の「Variables」タブで `LOCATION` を追加（例：`Tokyo,Tokyo,Japan`）。
+   指定しなければ日本全体。表記は SerpApi の Locations 一覧に合わせる
+
+## 使い方
+
+1. `keywords.csv` と `domains.csv` を GitHub 上で編集（鉛筆アイコン）してコミット
+   - `domains.csv` の `label` はExcelの列名になる（例：対象会社、競合A）
+   - `example.com` と書けば `www.example.com` や `sub.example.com` も含めて判定。サブドメインだけ追いたい場合はそのまま `sub.example.com` と書く
+2. **Actions タブ → rank-check → Run workflow** で、端末とページ数を選んで実行
+3. 数分で完了。結果は以下のどちらかで取得
+   - リポジトリの `reports/rank_report_latest.xlsx` → 「Download raw file」
+   - 実行結果ページ下部の Artifacts「rank-report」
+
+## クレジット消費の目安
+
+1回の実行 = **キーワード数 × 端末数 × ページ数**（1ページ = 上位10件）
+例：50キーワード × スマホのみ × 2ページ = 100クレジット。毎日回すと月 約3,000。
+広告は1ページ目にしか出ないので、広告だけ見たいならページ数 1 で十分。
+
+## 定期実行
+
+`.github/workflows/rank-check.yml` の `schedule:` と `cron:` の2行の先頭 `#` を外すと毎日 9:00（JST）に自動実行。
+数分〜数十分遅れて起動することがある。
+
+## Excelの中身
+
+| シート | 内容 |
+|---|---|
+| 説明 | 実行条件と各シートの見方 |
+| オーガニック_最新 | 最新実行時の各ドメインの最高順位（取得範囲外は「圏外」） |
+| オーガニック_推移 | 実行ごとの順位推移 |
+| 広告_出現率 | 直近30日の計測回数のうち、そのドメインの広告が出た割合 |
+| 広告_上部平均順位 | 上部広告枠に出たときの平均掲載順位 |
+| 生データ_最新 | 最新実行の全結果（追跡対象外のサイトも含むので競合探しに使える） |
+| 実行ログ | 各キーワードの取得成否 |
+
+`domains.csv` にドメインを後から追加すると、過去の蓄積データにも遡って反映される。
+
+## 注意
+
+- 広告の掲載順はオークションで都度変わる。1回の結果ではなく、複数回の出現率で判断すること
+- 検索結果は地域・端末・時間帯で変わる。実際の画面と多少ずれることがある
+- データをリセットしたいときは `data/` フォルダの CSV を削除
