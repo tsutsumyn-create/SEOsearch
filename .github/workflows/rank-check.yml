@@ -1,0 +1,61 @@
+name: rank-check
+
+on:
+  # Actions タブの「Run workflow」ボタンから手動実行
+  workflow_dispatch:
+    inputs:
+      devices:
+        description: "端末（mobile / desktop / mobile,desktop）"
+        default: "mobile"
+        required: true
+      pages:
+        description: "取得ページ数（1ページ=上位10件。キーワード×端末×ページ数だけクレジットを消費）"
+        default: "2"
+        required: true
+  # 定期実行したい場合は下の2行の先頭の # を外す（毎日 9:00 JST）
+  # schedule:
+  #   - cron: "0 0 * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: rank-check
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: ライブラリのインストール
+        run: pip install -r requirements.txt
+
+      - name: 順位取得とレポート作成
+        env:
+          SERPAPI_KEY: ${{ secrets.SERPAPI_KEY }}
+          DEVICES: ${{ github.event.inputs.devices || 'mobile' }}
+          PAGES: ${{ github.event.inputs.pages || '2' }}
+          LOCATION: ${{ vars.LOCATION }}
+          WINDOW_DAYS: "30"
+        run: python rank_check.py
+
+      - name: 結果をリポジトリに保存
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data reports
+          git diff --cached --quiet || git commit -m "rank check $(date -u +'%Y-%m-%d %H:%M') UTC"
+          git push
+
+      - name: レポートをダウンロード用に添付
+        uses: actions/upload-artifact@v4
+        with:
+          name: rank-report
+          path: reports/rank_report_latest.xlsx
